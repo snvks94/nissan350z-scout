@@ -3,6 +3,7 @@ import requests
 import hashlib
 from bs4 import BeautifulSoup
 
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -11,7 +12,7 @@ SEEN_FILE = "seen.txt"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 BAD_WORDS = ["swap","projekt","brak","uszkodz","na części","bez dokument","drift"]
 
-# ---------------- Helpers ----------------
+# ---------------- HELPERS ----------------
 
 def load_seen():
     try:
@@ -28,18 +29,21 @@ def save_seen(seen):
         print(f"Save seen error: {e}")
 
 def send(msg):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("BOT_TOKEN or CHAT_ID not set, skipping Telegram send")
+        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg,"disable_web_page_preview": False}, timeout=10)
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "disable_web_page_preview": False}, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
+
+def hash_id(text):
+    return hashlib.md5(text.encode()).hexdigest()
 
 def is_bad(text):
     txt = text.lower()
     return any(w in txt for w in BAD_WORDS)
-
-def hash_id(text):
-    return hashlib.md5(text.encode()).hexdigest()
 
 def get_kurs_eur_pln():
     try:
@@ -63,49 +67,53 @@ def ocena(cena_eur, title):
         return "ℹ️ DO SPRAWDZENIA"
     return "❌ POZA BUDŻETEM"
 
-# ---------------- POLAND ----------------
+# ---------------- PORTALS ----------------
+
+def safe_request(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            return r
+    except Exception as e:
+        print(f"Request failed: {url} -> {e}")
+    return None
 
 def olx_rss():
+    r = safe_request("https://www.olx.pl/auta/q-nissan-350z/rss/")
+    if not r: return
     try:
-        r = requests.get("https://www.olx.pl/auta/q-nissan-350z/rss/", headers=HEADERS, timeout=10)
-        if r.status_code != 200: return
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
             link = item.find("link").text
             uid = hash_id(link)
             if uid in seen: continue
             seen.add(uid)
-            title = item.find("title").text
+            title = item.find("title").text if item.find("title") else "Nissan 350Z"
             opinia = ocena(MAX_EUR, title)
-            send(f"🇵🇱 {title}\nCena EUR (przybliżona): ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
+            send(f"🇵🇱 {title}\nCena EUR ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
     except Exception as e:
-        print(f"OLX error: {e}")
+        print(f"OLX parse error: {e}")
 
 def otomoto_rss():
+    r = safe_request("https://www.otomoto.pl/rss?search%5Bfilter_float_price%3Ato%5D=11000&search%5Bquery%5D=nissan+350z")
+    if not r: return
     try:
-        r = requests.get(
-            "https://www.otomoto.pl/rss?search%5Bfilter_float_price%3Ato%5D=11000&search%5Bquery%5D=nissan+350z",
-            headers=HEADERS, timeout=10
-        )
-        if r.status_code != 200: return
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
             link = item.find("link").text
             uid = hash_id(link)
             if uid in seen: continue
             seen.add(uid)
-            title = item.find("title").text
+            title = item.find("title").text if item.find("title") else "Nissan 350Z"
             opinia = ocena(MAX_EUR, title)
-            send(f"🇵🇱 {title}\nCena EUR (przybliżona): ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
+            send(f"🇵🇱 {title}\nCena EUR ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
     except Exception as e:
-        print(f"Otomoto error: {e}")
+        print(f"Otomoto parse error: {e}")
 
-# ---------------- AUTOSCOUT24 ----------------
-
-def parse_autoscout24_listing(listing_url):
+def parse_autoscout24_listing(url):
+    r = safe_request(url)
+    if not r: return "Nissan 350Z", MAX_EUR, "?", "?"
     try:
-        r = requests.get(listing_url, headers=HEADERS, timeout=10)
-        if r.status_code != 200: return "Nissan 350Z", MAX_EUR, "?", "?"
         page = BeautifulSoup(r.text, "lxml")
         title = page.find("h1").get_text(strip=True) if page.find("h1") else "Nissan 350Z"
         price_elem = page.select_one("[data-test='price']")
@@ -114,19 +122,19 @@ def parse_autoscout24_listing(listing_url):
             txt = price_elem.get_text().replace("€","").replace(",","").strip()
             try: price_eur = float(txt.split()[0])
             except: price_eur = None
-        year = page.select_one("[data-test='first-registration']")
-        year = year.get_text(strip=True) if year else "?"
-        loc = page.select_one("[data-test='seller-location']")
-        loc = loc.get_text(strip=True) if loc else "?"
+        year_elem = page.select_one("[data-test='first-registration']")
+        year = year_elem.get_text(strip=True) if year_elem else "?"
+        loc_elem = page.select_one("[data-test='seller-location']")
+        loc = loc_elem.get_text(strip=True) if loc_elem else "?"
         return title, price_eur, year, loc
     except Exception as e:
         print(f"AutoScout parse error: {e}")
         return "Nissan 350Z", MAX_EUR, "?", "?"
 
 def autoscout24():
+    r = safe_request(f"https://www.autoscout24.com/lst/nissan/350-z?price_to={MAX_EUR}")
+    if not r: return
     try:
-        r = requests.get(f"https://www.autoscout24.com/lst/nissan/350-z?price_to={MAX_EUR}", headers=HEADERS, timeout=10)
-        if r.status_code != 200: return
         soup = BeautifulSoup(r.text, "lxml")
         for a in soup.select("a[data-test='listing-title']"):
             href = a.get("href")
@@ -142,12 +150,10 @@ def autoscout24():
     except Exception as e:
         print(f"AutoScout main error: {e}")
 
-# ---------------- MOBILE.DE ----------------
-
 def parse_mobilede_listing(url):
+    r = safe_request(url)
+    if not r: return "Nissan 350Z", MAX_EUR, "?", "?"
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        if r.status_code != 200: return "Nissan 350Z", MAX_EUR, "?", "?"
         page = BeautifulSoup(r.text, "lxml")
         title = page.select_one("h1").get_text(strip=True) if page.select_one("h1") else "Nissan 350Z"
         price_elem = page.select_one("span[data-testid='price']")
@@ -156,22 +162,19 @@ def parse_mobilede_listing(url):
             txt = price_elem.get_text().replace("€","").replace(".","").strip()
             try: price_eur = float(txt.split()[0])
             except: price_eur = None
-        year = page.select_one("li[data-testid='first-registration']")
-        year = year.get_text(strip=True) if year else "?"
-        loc = page.select_one("li[data-testid='seller-location']")
-        loc = loc.get_text(strip=True) if loc else "?"
+        year_elem = page.select_one("li[data-testid='first-registration']")
+        year = year_elem.get_text(strip=True) if year_elem else "?"
+        loc_elem = page.select_one("li[data-testid='seller-location']")
+        loc = loc_elem.get_text(strip=True) if loc_elem else "?"
         return title, price_eur, year, loc
     except Exception as e:
         print(f"Mobile.de parse error: {e}")
         return "Nissan 350Z", MAX_EUR, "?", "?"
 
 def mobile_de():
+    r = safe_request(f"https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&mk=18700&ms=20&sb=rel&vc=Car&fc=EUR&pr=%3A{MAX_EUR}")
+    if not r: return
     try:
-        r = requests.get(
-            f"https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&mk=18700&ms=20&sb=rel&vc=Car&fc=EUR&pr=%3A{MAX_EUR}",
-            headers=HEADERS, timeout=10
-        )
-        if r.status_code != 200: return
         soup = BeautifulSoup(r.text, "lxml")
         for a in soup.select("a[href*='/pl/samochod/']"):
             full_link = a.get("href")
