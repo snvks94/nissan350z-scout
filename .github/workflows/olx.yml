@@ -25,5 +25,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           OLX_SEARCH_URL: "https://www.olx.pl/motoryzacja/samochody/nissan/q-350z/"
+          MAX_PLN: "46000"
           MAX_DETAIL_PAGES_PER_RUN: "20"
         run: python bot_olx.py
