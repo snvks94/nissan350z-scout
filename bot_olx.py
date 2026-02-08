@@ -1,17 +1,15 @@
+import hashlib
 import json
 import os
 import random
 import re
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------
-# Konfiguracja
-# ---------------------------------
 DEFAULT_SEARCH_URL = "https://www.olx.pl/motoryzacja/samochody/nissan/q-350z/"
 SEARCH_URL = os.getenv("OLX_SEARCH_URL", DEFAULT_SEARCH_URL)
 
@@ -21,7 +19,12 @@ NBP_EUR_URL = "https://api.nbp.pl/api/exchangerates/rates/a/eur?format=json"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SEEN_FILE = "seen.json"
+# Nowy, “bulletproof” storage
+SENT_STORE_FILE = "sent_store.json"
+
+# Stary plik (z poprzedniej wersji) – jeśli istnieje, zmigrujemy
+LEGACY_SENT_FILE = "sent.json"
+
 DEBUG_DIR = "debug"
 
 HEADERS = {
@@ -29,48 +32,28 @@ HEADERS = {
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
 }
 
-# “Jak człowiek”: opóźnienie przed czytaniem oferty (wejściem w szczegóły)
 DETAIL_DELAY_RANGE: Tuple[int, int] = (10, 20)
-
-# Bezpiecznik na czas działania workflow
 MAX_DETAIL_PAGES_PER_RUN = int(os.getenv("MAX_DETAIL_PAGES_PER_RUN", "20"))
 
 PRICE_RE = re.compile(r"([\d\s]+)(?:[,.](\d{1,2}))?")
-
-# Blacklista: uszkodzone / do remontu / zajechane / dawca / na części itd.
 BLACKLIST_PATTERNS = [
-    r"\buszkodz\w*",          # uszkodzony/uszkodzona/uszkodzone
-    r"\brozbit\w*",
-    r"\bwypadk\w*",           # “po wypadku”, “wypadkowy”
-    r"\bdawca\b",
-    r"\bna\s*części\b",
-    r"\bczęści\b",
-    r"\bniesprawn\w*",
-    r"\bspalon\w*",
-    r"\bdo\s*remontu\b",
-    r"\bremont\s*silnika\b",
-    r"\bsilnik\s*do\s*remontu\b",
-    r"\bskrzynia\s*do\s*remontu\b",
-    r"\bdo\s*naprawy\b",
-    r"\bwymaga\s*napraw\w*\b",
-    r"\bkorozj\w*",           # korozja / skorodowany
-    r"\brdza\w*",
-    r"\bzajechan\w*",         # “zajechany”
-    r"\bkatowan\w*",          # “katowany”
-    r"\btorow\w*",            # “torowy” (często po ostrym użytkowaniu)
-    r"\bstuk\w*\b",           # “stuki”, “stuka”
-    r"\bpanewk\w*",           # panewki
-    r"\bbrak\s*(przeglądu|oc)\b",
-    r"\bbez\s*(przeglądu|oc)\b",
+    r"\buszkodz\w*", r"\brozbit\w*", r"\bwypadk\w*", r"\bdawca\b",
+    r"\bna\s*części\b", r"\bczęści\b", r"\bniesprawn\w*", r"\bspalon\w*",
+    r"\bdo\s*remontu\b", r"\bremont\s*silnika\b", r"\bsilnik\s*do\s*remontu\b",
+    r"\bskrzynia\s*do\s*remontu\b", r"\bdo\s*naprawy\b", r"\bwymaga\s*napraw\w*\b",
+    r"\bkorozj\w*", r"\brdza\w*", r"\bzajechan\w*", r"\bkatowan\w*", r"\btorow\w*",
+    r"\bstuk\w*\b", r"\bpanewk\w*", r"\bbrak\s*(przeglądu|oc)\b", r"\bbez\s*(przeglądu|oc)\b",
 ]
-
 BLACKLIST_RE = re.compile("|".join(f"(?:{p})" for p in BLACKLIST_PATTERNS), re.IGNORECASE)
+
+# Czasem OLX ma w HTML/JSON wartości typu "offerId": 1234567890
+OFFER_ID_RE = re.compile(r'"offerId"\s*:\s*(\d+)', re.IGNORECASE)
+AD_ID_RE = re.compile(r'"id"\s*:\s*(\d+)', re.IGNORECASE)  # fallback
 
 
 @dataclass
 class OfferStub:
     url: str
-    offer_id: str
 
 
 @dataclass
@@ -79,26 +62,13 @@ class Offer:
     price_pln: Optional[float]
     location: str
     url: str
-    offer_id: str
+    canonical_url: str
+    numeric_id: Optional[str]
+    signature: str
 
 
 def ensure_debug_dir() -> None:
     os.makedirs(DEBUG_DIR, exist_ok=True)
-
-
-def load_seen() -> Set[str]:
-    if not os.path.exists(SEEN_FILE):
-        return set()
-    try:
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-
-def save_seen(seen: Set[str]) -> None:
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(list(seen)), f, ensure_ascii=False, indent=2)
 
 
 def get_eur_pln_rate() -> float:
@@ -118,7 +88,14 @@ def parse_price_pln(text: str) -> Optional[float]:
     cleaned = t.replace("zł", "").replace("pln", "").strip()
     m = PRICE_RE.search(cleaned)
     if not m:
-        return None
+        # spróbuj jeszcze prostszy wariant bez groszy
+        m2 = re.search(r"([\d\s]+)", cleaned)
+        if not m2:
+            return None
+        try:
+            return float(int(m2.group(1).replace(" ", "")))
+        except Exception:
+            return None
 
     whole = m.group(1).replace(" ", "")
     frac = m.group(2) or "00"
@@ -129,53 +106,150 @@ def parse_price_pln(text: str) -> Optional[float]:
 
 
 def is_blacklisted(text: str) -> bool:
-    if not text:
-        return False
-    return bool(BLACKLIST_RE.search(text))
+    return bool(text and BLACKLIST_RE.search(text))
 
 
-def normalize_offer_id(url: str) -> str:
-    # OLX często ma końcówkę .html i parametry
-    u = url.split("?")[0].rstrip("/")
-    last = u.split("/")[-1]
-    last = last.replace(".html", "")
-    return last or u
+def canonicalize_url(url: str) -> str:
+    # usuń tracking, hash
+    u = url.split("#")[0].split("?")[0].rstrip("/")
+    # usuń .html jeśli jest
+    if u.endswith(".html"):
+        u = u[:-5]
+    return u
+
+
+def url_signature(url: str) -> str:
+    """
+    Dodatkowy “pół-canonical”: sama ścieżka /d/oferta/... (bez domeny),
+    żeby łapać duplikaty gdy domena / subdomena się różni.
+    """
+    u = canonicalize_url(url)
+    # weź ścieżkę od /d/oferta/
+    idx = u.find("/d/oferta/")
+    if idx >= 0:
+        return u[idx:]
+    return u
+
+
+def make_signature(title: str, price_pln: Optional[float], location: str, canonical_url: str) -> str:
+    """
+    Ostateczny fallback, gdy nie uda się ustalić numeric ID.
+    Staramy się, żeby był stabilny mimo drobnych zmian w URL.
+    """
+    t = (title or "").strip().lower()
+    loc = (location or "").strip().lower()
+    price = "" if price_pln is None else f"{int(round(price_pln))}"
+    base = f"{t}|{price}|{loc}|{canonical_url}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:20]
+
+
+def load_sent_store() -> Dict[str, Set[str]]:
+    """
+    Zwraca słownik z trzema setami:
+      - ids: numeric IDs z OLX (string)
+      - urls: canonical urls
+      - sigs: fallback signatures
+      - url_sigs: path signatures (opcjonalnie)
+    """
+    store = {"ids": set(), "urls": set(), "sigs": set(), "url_sigs": set()}
+
+    # Migracja ze starego sent.json (lista offer_id lub podobna)
+    if os.path.exists(LEGACY_SENT_FILE) and not os.path.exists(SENT_STORE_FILE):
+        try:
+            with open(LEGACY_SENT_FILE, "r", encoding="utf-8") as f:
+                legacy = json.load(f)
+            # legacy mogło być listą “offer_id” (często z URL) – wrzucamy do sigs jako “legacy”
+            for item in legacy:
+                if isinstance(item, str) and item:
+                    store["sigs"].add(f"legacy:{item}")
+            save_sent_store(store)
+        except Exception:
+            pass
+
+    if not os.path.exists(SENT_STORE_FILE):
+        return store
+
+    try:
+        with open(SENT_STORE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in store.keys():
+            if k in data and isinstance(data[k], list):
+                store[k] = set(str(x) for x in data[k] if str(x))
+    except Exception:
+        pass
+
+    return store
+
+
+def save_sent_store(store: Dict[str, Set[str]]) -> None:
+    data = {k: sorted(list(v)) for k, v in store.items()}
+    with open(SENT_STORE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def is_already_sent(store: Dict[str, Set[str]], numeric_id: Optional[str], canonical_url: str, sig: str, u_sig: str) -> bool:
+    if numeric_id and numeric_id in store["ids"]:
+        return True
+    if canonical_url in store["urls"]:
+        return True
+    if u_sig in store["url_sigs"]:
+        return True
+    if sig in store["sigs"]:
+        return True
+    return False
+
+
+def mark_as_sent(store: Dict[str, Set[str]], numeric_id: Optional[str], canonical_url: str, sig: str, u_sig: str) -> None:
+    if numeric_id:
+        store["ids"].add(numeric_id)
+    store["urls"].add(canonical_url)
+    store["url_sigs"].add(u_sig)
+    store["sigs"].add(sig)
 
 
 def fetch_list_stubs() -> List[OfferStub]:
     resp = requests.get(SEARCH_URL, headers=HEADERS, timeout=25)
     resp.raise_for_status()
-    html = resp.text
-
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(resp.text, "lxml")
 
     anchors = soup.select('a[href*="/d/oferta/"]')
     stubs: List[OfferStub] = []
-    seen_urls = set()
+    uniq = set()
 
     for a in anchors:
         href = a.get("href") or ""
         if "/d/oferta/" not in href:
             continue
         url = href if href.startswith("http") else f"https://www.olx.pl{href}"
-        url = url.split("#")[0]
-        if url in seen_urls:
+        c = canonicalize_url(url)
+        if c in uniq:
             continue
-        seen_urls.add(url)
-
-        offer_id = normalize_offer_id(url)
-        stubs.append(OfferStub(url=url, offer_id=offer_id))
+        uniq.add(c)
+        stubs.append(OfferStub(url=url))
 
     if not stubs:
         ensure_debug_dir()
         with open(os.path.join(DEBUG_DIR, "list_debug.html"), "w", encoding="utf-8") as f:
-            f.write(html)
+            f.write(resp.text)
 
     return stubs
 
 
-def fetch_offer_details(stub: OfferStub) -> Optional[Offer]:
-    # “Czytanie jak człowiek”
+def extract_numeric_id(html: str) -> Optional[str]:
+    m = OFFER_ID_RE.search(html)
+    if m:
+        return m.group(1)
+
+    # fallback: czasem id jest w JSON-LD lub innej strukturze
+    # (nie zawsze będzie trafne, ale jako alternatywa)
+    m2 = AD_ID_RE.search(html)
+    if m2:
+        return m2.group(1)
+
+    return None
+
+
+def fetch_offer_details(stub: OfferStub) -> Optional[tuple[Offer, str]]:
     time.sleep(random.uniform(*DETAIL_DELAY_RANGE))
 
     r = requests.get(stub.url, headers=HEADERS, timeout=25)
@@ -185,47 +259,53 @@ def fetch_offer_details(stub: OfferStub) -> Optional[Offer]:
     html = r.text
     soup = BeautifulSoup(html, "lxml")
 
-    # Tytuł: zwykle h1
+    canonical_url = canonicalize_url(stub.url)
+    u_sig = url_signature(stub.url)
+
     h1 = soup.find("h1")
     title = (h1.get_text(" ", strip=True) if h1 else "").strip()
 
-    # Cena: próbujemy znaleźć fragment z “zł”
+    # Cena: znajdź pierwszą sensowną
     price_pln = None
     price_candidates = soup.find_all(string=re.compile(r"\bzł\b", re.IGNORECASE))
-    for s in price_candidates[:30]:
+    for s in price_candidates[:50]:
         p = parse_price_pln(str(s))
         if p is not None:
             price_pln = p
             break
 
-    # Lokalizacja: szukamy “data - miasto” albo elementów z breadcrumb / address
+    # Lokalizacja: heurystyka “Miasto - data”
     location = "—"
-    # Heurystyka: często w tekście jest “Miasto - data”
-    text = soup.get_text("\n", strip=True)
-    for line in text.split("\n"):
-        if " - " in line and any(m in line.lower() for m in ["stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca",
-                                                             "lipca", "sierpnia", "września", "października", "listopada",
-                                                             "grudnia", "dzisiaj", "wczoraj", "odświeżono"]):
+    page_text = soup.get_text("\n", strip=True)
+    for line in page_text.split("\n"):
+        if " - " in line and any(m in line.lower() for m in [
+            "stycznia", "lutego", "marca", "kwietnia", "maja", "czerwca",
+            "lipca", "sierpnia", "września", "października", "listopada",
+            "grudnia", "dzisiaj", "wczoraj", "odświeżono"
+        ]):
             location = line.split(" - ")[0].strip()
             break
 
-    # Opis: przydaje się do blacklisty
-    # Weźmy duży kawał tekstu (bez JS), wystarczy do filtrów słów kluczowych
-    combined_for_blacklist = f"{title}\n{text}"
+    numeric_id = extract_numeric_id(html)
+    sig = make_signature(title, price_pln, location, canonical_url)
 
-    # Jeśli tytuł nie istnieje — zapisz debug
     if not title:
         ensure_debug_dir()
-        with open(os.path.join(DEBUG_DIR, f"offer_{stub.offer_id}.html"), "w", encoding="utf-8") as f:
+        with open(os.path.join(DEBUG_DIR, f"offer_debug_{sig}.html"), "w", encoding="utf-8") as f:
             f.write(html)
 
-    return Offer(
+    offer = Offer(
         title=title or "—",
         price_pln=price_pln,
         location=location or "—",
         url=stub.url,
-        offer_id=stub.offer_id,
-    ), combined_for_blacklist
+        canonical_url=canonical_url,
+        numeric_id=numeric_id,
+        signature=sig,
+    )
+
+    combined_for_blacklist = f"{offer.title}\n{page_text}"
+    return offer, combined_for_blacklist
 
 
 def telegram_send(text: str) -> None:
@@ -243,16 +323,12 @@ def telegram_send(text: str) -> None:
 
 
 def format_msg(o: Offer) -> str:
-    if o.price_pln is None:
-        price = "—"
-    else:
-        # 46 000 zamiast 46,000.00
-        price = f"{o.price_pln:,.0f} PLN".replace(",", " ")
+    price = "—" if o.price_pln is None else f"{o.price_pln:,.0f} PLN".replace(",", " ")
     return (
         f"🚗 {o.title}\n"
         f"💰 {price}\n"
         f"📍 {o.location}\n"
-        f"🔗 {o.url}"
+        f"🔗 {o.canonical_url}"
     )
 
 
@@ -260,46 +336,50 @@ def main():
     eur_rate = get_eur_pln_rate()
     max_pln = MAX_EUR * eur_rate
 
-    seen = load_seen()
+    store = load_sent_store()
     stubs = fetch_list_stubs()
 
-    sent = 0
-    checked_details = 0
+    checked = 0
+    sent_now = 0
 
     for stub in stubs:
-        if stub.offer_id in seen:
-            continue
-
-        if checked_details >= MAX_DETAIL_PAGES_PER_RUN:
+        if checked >= MAX_DETAIL_PAGES_PER_RUN:
             break
 
-        result = fetch_offer_details(stub)
-        checked_details += 1
-        seen.add(stub.offer_id)  # oznaczamy jako “już widziane” niezależnie od wyniku
-
-        if not result:
+        details = fetch_offer_details(stub)
+        checked += 1
+        if not details:
             continue
 
-        offer, blacklist_text = result
+        offer, blacklist_text = details
+        u_sig = url_signature(offer.url)
 
-        # Blacklista (tytuł + treść)
+        # Dedupe “bulletproof”
+        if is_already_sent(store, offer.numeric_id, offer.canonical_url, offer.signature, u_sig):
+            continue
+
+        # Filtry jakości / stanu
         if is_blacklisted(blacklist_text):
             continue
 
-        # Musi mieć cenę i mieścić się w limicie
+        # Filtr ceny
         if offer.price_pln is None:
             continue
+        if offer.price_pln > max_pln:
+            continue
 
-        if offer.price_pln <= max_pln:
-            telegram_send(format_msg(offer))
-            sent += 1
-            # mała przerwa między wysyłkami (nie mylić z czytaniem ofert)
-            time.sleep(1.5)
+        # Wysyłka -> dopiero wtedy zapis do store
+        telegram_send(format_msg(offer))
+        mark_as_sent(store, offer.numeric_id, offer.canonical_url, offer.signature, u_sig)
+        sent_now += 1
 
-    save_seen(seen)
+        time.sleep(1.5)
+
+    save_sent_store(store)
     print(
         f"EUR/PLN={eur_rate:.4f} | limit={max_pln:.2f} PLN | "
-        f"stuby={len(stubs)} | przeczytane_oferty={checked_details} | wysłano={sent}"
+        f"stuby={len(stubs)} | przeczytane_oferty={checked} | wysłano={sent_now} | "
+        f"ids={len(store['ids'])} urls={len(store['urls'])} sigs={len(store['sigs'])}"
     )
 
 
