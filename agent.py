@@ -41,16 +41,18 @@ def is_bad(text):
 def hash_id(text):
     return hashlib.md5(text.encode()).hexdigest()
 
-# Pobierz kurs EUR -> PLN z NBP
 def get_kurs_eur_pln():
     try:
         r = requests.get("https://api.nbp.pl/api/exchangerates/rates/A/EUR/?format=json", timeout=10)
-        j = r.json()
-        return float(j["rates"][-1]["mid"])
+        if r.status_code == 200:
+            j = r.json()
+            return float(j["rates"][-1]["mid"])
     except:
-        return 4.3  # fallback
+        pass
+    return 4.3  # fallback
 
 kurs_eur = get_kurs_eur_pln()
+seen = load_seen()
 
 def ocena(cena_eur, title):
     if is_bad(title):
@@ -61,13 +63,12 @@ def ocena(cena_eur, title):
         return "ℹ️ DO SPRAWDZENIA"
     return "❌ POZA BUDŻETEM"
 
-seen = load_seen()
-
 # ---------------- POLAND ----------------
 
 def olx_rss():
     try:
         r = requests.get("https://www.olx.pl/auta/q-nissan-350z/rss/", headers=HEADERS, timeout=10)
+        if r.status_code != 200: return
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
             link = item.find("link").text
@@ -82,8 +83,11 @@ def olx_rss():
 
 def otomoto_rss():
     try:
-        r = requests.get("https://www.otomoto.pl/rss?search%5Bfilter_float_price%3Ato%5D=11000&search%5Bquery%5D=nissan+350z",
-                         headers=HEADERS, timeout=10)
+        r = requests.get(
+            "https://www.otomoto.pl/rss?search%5Bfilter_float_price%3Ato%5D=11000&search%5Bquery%5D=nissan+350z",
+            headers=HEADERS, timeout=10
+        )
+        if r.status_code != 200: return
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
             link = item.find("link").text
@@ -101,32 +105,28 @@ def otomoto_rss():
 def parse_autoscout24_listing(listing_url):
     try:
         r = requests.get(listing_url, headers=HEADERS, timeout=10)
+        if r.status_code != 200: return "Nissan 350Z", MAX_EUR, "?", "?"
         page = BeautifulSoup(r.text, "lxml")
-        title_elem = page.find("h1")
-        title = title_elem.get_text(strip=True) if title_elem else "Nissan 350Z"
-
+        title = page.find("h1").get_text(strip=True) if page.find("h1") else "Nissan 350Z"
         price_elem = page.select_one("[data-test='price']")
         price_eur = None
         if price_elem:
             txt = price_elem.get_text().replace("€","").replace(",","").strip()
             try: price_eur = float(txt.split()[0])
             except: price_eur = None
-
-        year_elem = page.select_one("[data-test='first-registration']")
-        year = year_elem.get_text(strip=True) if year_elem else "?"
-
-        loc_elem = page.select_one("[data-test='seller-location']")
-        location = loc_elem.get_text(strip=True) if loc_elem else "?"
-
-        return title, price_eur, year, location
+        year = page.select_one("[data-test='first-registration']")
+        year = year.get_text(strip=True) if year else "?"
+        loc = page.select_one("[data-test='seller-location']")
+        loc = loc.get_text(strip=True) if loc else "?"
+        return title, price_eur, year, loc
     except Exception as e:
         print(f"AutoScout parse error: {e}")
         return "Nissan 350Z", MAX_EUR, "?", "?"
 
 def autoscout24():
     try:
-        search_url = f"https://www.autoscout24.com/lst/nissan/350-z?price_to={MAX_EUR}"
-        r = requests.get(search_url, headers=HEADERS, timeout=10)
+        r = requests.get(f"https://www.autoscout24.com/lst/nissan/350-z?price_to={MAX_EUR}", headers=HEADERS, timeout=10)
+        if r.status_code != 200: return
         soup = BeautifulSoup(r.text, "lxml")
         for a in soup.select("a[data-test='listing-title']"):
             href = a.get("href")
@@ -135,11 +135,10 @@ def autoscout24():
             uid = hash_id(full_link)
             if uid in seen: continue
             seen.add(uid)
-
-            title, price_eur, year, location = parse_autoscout24_listing(full_link)
+            title, price_eur, year, loc = parse_autoscout24_listing(full_link)
             cena_pln = round(price_eur * kurs_eur) if price_eur else "?"
             opinia = ocena(price_eur if price_eur else MAX_EUR, title)
-            send(f"🇪🇺 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {location}\nOcena: {opinia}\n{full_link}")
+            send(f"🇪🇺 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {loc}\nOcena: {opinia}\n{full_link}")
     except Exception as e:
         print(f"AutoScout main error: {e}")
 
@@ -148,63 +147,62 @@ def autoscout24():
 def parse_mobilede_listing(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code != 200: return "Nissan 350Z", MAX_EUR, "?", "?"
         page = BeautifulSoup(r.text, "lxml")
-        title_elem = page.select_one("h1")
-        title = title_elem.get_text(strip=True) if title_elem else "Nissan 350Z"
-
+        title = page.select_one("h1").get_text(strip=True) if page.select_one("h1") else "Nissan 350Z"
         price_elem = page.select_one("span[data-testid='price']")
         price_eur = None
         if price_elem:
             txt = price_elem.get_text().replace("€","").replace(".","").strip()
             try: price_eur = float(txt.split()[0])
             except: price_eur = None
-
-        year_elem = page.select_one("li[data-testid='first-registration']")
-        year = year_elem.get_text(strip=True) if year_elem else "?"
-
-        loc_elem = page.select_one("li[data-testid='seller-location']")
-        location = loc_elem.get_text(strip=True) if loc_elem else "?"
-        return title, price_eur, year, location
+        year = page.select_one("li[data-testid='first-registration']")
+        year = year.get_text(strip=True) if year else "?"
+        loc = page.select_one("li[data-testid='seller-location']")
+        loc = loc.get_text(strip=True) if loc else "?"
+        return title, price_eur, year, loc
     except Exception as e:
         print(f"Mobile.de parse error: {e}")
         return "Nissan 350Z", MAX_EUR, "?", "?"
 
 def mobile_de():
     try:
-        search_url = f"https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&mk=18700&ms=20&sb=rel&vc=Car&fc=EUR&pr=%3A{MAX_EUR}"
-        r = requests.get(search_url, headers=HEADERS, timeout=10)
+        r = requests.get(
+            f"https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&mk=18700&ms=20&sb=rel&vc=Car&fc=EUR&pr=%3A{MAX_EUR}",
+            headers=HEADERS, timeout=10
+        )
+        if r.status_code != 200: return
         soup = BeautifulSoup(r.text, "lxml")
         for a in soup.select("a[href*='/pl/samochod/']"):
-            full_link = a["href"]
+            full_link = a.get("href")
             if not full_link.startswith("http"): full_link = "https://www.mobile.de" + full_link
             uid = hash_id(full_link)
             if uid in seen: continue
             seen.add(uid)
-
-            title, price_eur, year, location = parse_mobilede_listing(full_link)
+            title, price_eur, year, loc = parse_mobilede_listing(full_link)
             cena_pln = round(price_eur * kurs_eur) if price_eur else "?"
             opinia = ocena(price_eur if price_eur else MAX_EUR, title)
-            send(f"🇩🇪 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {location}\nOcena: {opinia}\n{full_link}")
+            send(f"🇩🇪 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {loc}\nOcena: {opinia}\n{full_link}")
     except Exception as e:
         print(f"Mobile.de main error: {e}")
 
 # ---------------- RUN ----------------
 
+def safe_run(func, name):
+    try:
+        func()
+    except Exception as e:
+        print(f"{name} failed: {e}")
+
+def main():
+    safe_run(olx_rss, "OLX")
+    safe_run(otomoto_rss, "Otomoto")
+    safe_run(autoscout24, "AutoScout24")
+    safe_run(mobile_de, "Mobile.de")
+    save_seen(seen)
+
 if __name__ == "__main__":
     try:
-        olx_rss()
+        main()
     except Exception as e:
-        print(f"OLX failed: {e}")
-    try:
-        otomoto_rss()
-    except Exception as e:
-        print(f"Otomoto failed: {e}")
-    try:
-        autoscout24()
-    except Exception as e:
-        print(f"AutoScout24 failed: {e}")
-    try:
-        mobile_de()
-    except Exception as e:
-        print(f"Mobile.de failed: {e}")
-    save_seen(seen)
+        print(f"Unexpected global error: {e}")
