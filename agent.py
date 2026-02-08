@@ -3,7 +3,6 @@ import requests
 import hashlib
 from bs4 import BeautifulSoup
 
-# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -12,7 +11,7 @@ SEEN_FILE = "seen.txt"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 BAD_WORDS = ["swap","projekt","brak","uszkodz","na części","bez dokument","drift"]
 
-# ---------------- HELPERS ----------------
+# ---------------- Helpers ----------------
 
 def load_seen():
     try:
@@ -28,69 +27,79 @@ def save_seen(seen):
     except Exception as e:
         print(f"Save seen error: {e}")
 
-def send(msg):
+def safe_send(msg):
     if not BOT_TOKEN or not CHAT_ID:
         print("BOT_TOKEN or CHAT_ID not set, skipping Telegram send")
         return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg, "disable_web_page_preview": False}, timeout=10)
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg, "disable_web_page_preview": False},
+            timeout=10
+        )
+        r.raise_for_status()
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print(f"Telegram send failed: {e}")
 
 def hash_id(text):
     return hashlib.md5(text.encode()).hexdigest()
 
 def is_bad(text):
+    if not text: return False
     txt = text.lower()
     return any(w in txt for w in BAD_WORDS)
 
 def get_kurs_eur_pln():
     try:
         r = requests.get("https://api.nbp.pl/api/exchangerates/rates/A/EUR/?format=json", timeout=10)
-        if r.status_code == 200:
-            j = r.json()
-            return float(j["rates"][-1]["mid"])
-    except:
-        pass
-    return 4.3  # fallback
+        r.raise_for_status()
+        j = r.json()
+        rate = float(j.get("rates", [{}])[-1].get("mid", 4.3))
+        return rate
+    except Exception as e:
+        print(f"Failed to fetch EUR->PLN rate, using fallback: {e}")
+        return 4.3
 
 kurs_eur = get_kurs_eur_pln()
 seen = load_seen()
 
 def ocena(cena_eur, title):
+    if not title: title = ""
     if is_bad(title):
         return "⚠️ RYZYKO"
+    if cena_eur is None:
+        return "❓ NIEZNANA"
     if cena_eur <= MAX_EUR * 0.9:
         return "✅ OKAZJA"
     if cena_eur <= MAX_EUR:
         return "ℹ️ DO SPRAWDZENIA"
     return "❌ POZA BUDŻETEM"
 
-# ---------------- PORTALS ----------------
-
+# ---------------- Safe request ----------------
 def safe_request(url):
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
-        if r.status_code == 200:
-            return r
+        r.raise_for_status()
+        return r
     except Exception as e:
         print(f"Request failed: {url} -> {e}")
-    return None
+        return None
 
+# ---------------- POLAND ----------------
 def olx_rss():
     r = safe_request("https://www.olx.pl/auta/q-nissan-350z/rss/")
     if not r: return
     try:
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
-            link = item.find("link").text
+            link = item.find("link").text if item.find("link") else None
+            if not link: continue
             uid = hash_id(link)
             if uid in seen: continue
             seen.add(uid)
             title = item.find("title").text if item.find("title") else "Nissan 350Z"
             opinia = ocena(MAX_EUR, title)
-            send(f"🇵🇱 {title}\nCena EUR ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
+            safe_send(f"🇵🇱 {title}\nCena EUR ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
     except Exception as e:
         print(f"OLX parse error: {e}")
 
@@ -100,16 +109,18 @@ def otomoto_rss():
     try:
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
-            link = item.find("link").text
+            link = item.find("link").text if item.find("link") else None
+            if not link: continue
             uid = hash_id(link)
             if uid in seen: continue
             seen.add(uid)
             title = item.find("title").text if item.find("title") else "Nissan 350Z"
             opinia = ocena(MAX_EUR, title)
-            send(f"🇵🇱 {title}\nCena EUR ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
+            safe_send(f"🇵🇱 {title}\nCena EUR ≤{MAX_EUR}\nOcena: {opinia}\n{link}")
     except Exception as e:
         print(f"Otomoto parse error: {e}")
 
+# ---------------- AUTOSCOUT24 ----------------
 def parse_autoscout24_listing(url):
     r = safe_request(url)
     if not r: return "Nissan 350Z", MAX_EUR, "?", "?"
@@ -119,8 +130,7 @@ def parse_autoscout24_listing(url):
         price_elem = page.select_one("[data-test='price']")
         price_eur = None
         if price_elem:
-            txt = price_elem.get_text().replace("€","").replace(",","").strip()
-            try: price_eur = float(txt.split()[0])
+            try: price_eur = float(price_elem.get_text(strip=True).replace("€","").replace(",","").split()[0])
             except: price_eur = None
         year_elem = page.select_one("[data-test='first-registration']")
         year = year_elem.get_text(strip=True) if year_elem else "?"
@@ -146,10 +156,11 @@ def autoscout24():
             title, price_eur, year, loc = parse_autoscout24_listing(full_link)
             cena_pln = round(price_eur * kurs_eur) if price_eur else "?"
             opinia = ocena(price_eur if price_eur else MAX_EUR, title)
-            send(f"🇪🇺 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {loc}\nOcena: {opinia}\n{full_link}")
+            safe_send(f"🇪🇺 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {loc}\nOcena: {opinia}\n{full_link}")
     except Exception as e:
         print(f"AutoScout main error: {e}")
 
+# ---------------- MOBILE.DE ----------------
 def parse_mobilede_listing(url):
     r = safe_request(url)
     if not r: return "Nissan 350Z", MAX_EUR, "?", "?"
@@ -159,8 +170,7 @@ def parse_mobilede_listing(url):
         price_elem = page.select_one("span[data-testid='price']")
         price_eur = None
         if price_elem:
-            txt = price_elem.get_text().replace("€","").replace(".","").strip()
-            try: price_eur = float(txt.split()[0])
+            try: price_eur = float(price_elem.get_text(strip=True).replace("€","").replace(".","").split()[0])
             except: price_eur = None
         year_elem = page.select_one("li[data-testid='first-registration']")
         year = year_elem.get_text(strip=True) if year_elem else "?"
@@ -185,12 +195,11 @@ def mobile_de():
             title, price_eur, year, loc = parse_mobilede_listing(full_link)
             cena_pln = round(price_eur * kurs_eur) if price_eur else "?"
             opinia = ocena(price_eur if price_eur else MAX_EUR, title)
-            send(f"🇩🇪 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {loc}\nOcena: {opinia}\n{full_link}")
+            safe_send(f"🇩🇪 {title}\nRocznik: {year}\nCena: {price_eur} € (~{cena_pln} zł)\nLokalizacja: {loc}\nOcena: {opinia}\n{full_link}")
     except Exception as e:
         print(f"Mobile.de main error: {e}")
 
 # ---------------- RUN ----------------
-
 def safe_run(func, name):
     try:
         func()
