@@ -21,13 +21,16 @@ def load_seen():
         return set()
 
 def save_seen(seen):
-    with open(SEEN_FILE, "w") as f:
-        f.write("\n".join(seen))
+    try:
+        with open(SEEN_FILE, "w") as f:
+            f.write("\n".join(seen))
+    except Exception as e:
+        print(f"Save seen error: {e}")
 
 def send(msg):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": msg,"disable_web_page_preview": False})
+        requests.post(url, json={"chat_id": CHAT_ID, "text": msg,"disable_web_page_preview": False}, timeout=10)
     except Exception as e:
         print(f"Telegram error: {e}")
 
@@ -41,7 +44,7 @@ def hash_id(text):
 # Pobierz kurs EUR -> PLN z NBP
 def get_kurs_eur_pln():
     try:
-        r = requests.get("https://api.nbp.pl/api/exchangerates/rates/A/EUR/?format=json")
+        r = requests.get("https://api.nbp.pl/api/exchangerates/rates/A/EUR/?format=json", timeout=10)
         j = r.json()
         return float(j["rates"][-1]["mid"])
     except:
@@ -63,9 +66,8 @@ seen = load_seen()
 # ---------------- POLAND ----------------
 
 def olx_rss():
-    rss = "https://www.olx.pl/auta/q-nissan-350z/rss/"
     try:
-        r = requests.get(rss, headers=HEADERS)
+        r = requests.get("https://www.olx.pl/auta/q-nissan-350z/rss/", headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
             link = item.find("link").text
@@ -79,9 +81,9 @@ def olx_rss():
         print(f"OLX error: {e}")
 
 def otomoto_rss():
-    rss = "https://www.otomoto.pl/rss?search%5Bfilter_float_price%3Ato%5D=11000&search%5Bquery%5D=nissan+350z"
     try:
-        r = requests.get(rss, headers=HEADERS)
+        r = requests.get("https://www.otomoto.pl/rss?search%5Bfilter_float_price%3Ato%5D=11000&search%5Bquery%5D=nissan+350z",
+                         headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.content, "xml")
         for item in soup.find_all("item"):
             link = item.find("link").text
@@ -98,7 +100,7 @@ def otomoto_rss():
 
 def parse_autoscout24_listing(listing_url):
     try:
-        r = requests.get(listing_url, headers=HEADERS)
+        r = requests.get(listing_url, headers=HEADERS, timeout=10)
         page = BeautifulSoup(r.text, "lxml")
         title_elem = page.find("h1")
         title = title_elem.get_text(strip=True) if title_elem else "Nissan 350Z"
@@ -124,7 +126,7 @@ def parse_autoscout24_listing(listing_url):
 def autoscout24():
     try:
         search_url = f"https://www.autoscout24.com/lst/nissan/350-z?price_to={MAX_EUR}"
-        r = requests.get(search_url, headers=HEADERS)
+        r = requests.get(search_url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "lxml")
         for a in soup.select("a[data-test='listing-title']"):
             href = a.get("href")
@@ -145,7 +147,7 @@ def autoscout24():
 
 def parse_mobilede_listing(url):
     try:
-        r = requests.get(url, headers=HEADERS)
+        r = requests.get(url, headers=HEADERS, timeout=10)
         page = BeautifulSoup(r.text, "lxml")
         title_elem = page.select_one("h1")
         title = title_elem.get_text(strip=True) if title_elem else "Nissan 350Z"
@@ -170,7 +172,7 @@ def parse_mobilede_listing(url):
 def mobile_de():
     try:
         search_url = f"https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&mk=18700&ms=20&sb=rel&vc=Car&fc=EUR&pr=%3A{MAX_EUR}"
-        r = requests.get(search_url, headers=HEADERS)
+        r = requests.get(search_url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "lxml")
         for a in soup.select("a[href*='/pl/samochod/']"):
             full_link = a["href"]
@@ -188,8 +190,21 @@ def mobile_de():
 
 # ---------------- RUN ----------------
 
-olx_rss()
-otomoto_rss()
-autoscout24()
-mobile_de()
-save_seen(seen)
+if __name__ == "__main__":
+    try:
+        olx_rss()
+    except Exception as e:
+        print(f"OLX failed: {e}")
+    try:
+        otomoto_rss()
+    except Exception as e:
+        print(f"Otomoto failed: {e}")
+    try:
+        autoscout24()
+    except Exception as e:
+        print(f"AutoScout24 failed: {e}")
+    try:
+        mobile_de()
+    except Exception as e:
+        print(f"Mobile.de failed: {e}")
+    save_seen(seen)
