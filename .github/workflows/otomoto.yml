@@ -1,0 +1,43 @@
+name: OTOMOTO Nissan 350Z -> Telegram
+
+on:
+  schedule:
+    - cron: "0 * * * *"   # co godzinę
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore sent store cache
+        uses: actions/cache@v4
+        with:
+          path: sent_store_otomoto.json
+          key: sent-store-otomoto-${{ github.run_id }}
+          restore-keys: |
+            sent-store-otomoto-
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OTOMOTO_SEARCH_URL: "https://www.otomoto.pl/osobowe/nissan/350z"
+          MAX_PLN: "46000"
+          MAX_DETAIL_PAGES_PER_RUN: "20"
+        run: python bot_otomoto.py
+
+      - name: Debug state
+        run: |
+          ls -la sent_store_otomoto.json || true
+          wc -c sent_store_otomoto.json || true
