@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 # ======================================================
 SEARCH_URL = os.getenv(
     "OTOMOTO_SEARCH_URL",
-    # Możesz podmienić na własny URL z filtrami (np. tylko Nissan 350Z)
+    # W teorii to powinno zwracać 350Z, ale i tak mamy twardy filtr po tytule/parametrach
     "https://www.otomoto.pl/osobowe/nissan/350z"
 )
 
@@ -27,7 +27,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SENT_STORE_FILE = "sent_store_otomoto.json"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; OTOMOTO-350Z-Bot/1.0; +https://github.com/)",
+    "User-Agent": "Mozilla/5.0 (compatible; OTOMOTO-350Z-Bot/1.1; +https://github.com/)",
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
 }
 
@@ -35,12 +35,11 @@ DETAIL_DELAY_RANGE: Tuple[int, int] = (10, 20)
 MAX_DETAIL_PAGES_PER_RUN = int(os.getenv("MAX_DETAIL_PAGES_PER_RUN", "20"))
 
 # ======================================================
-# REGEX
+# FILTRY / REGEXY
 # ======================================================
 PRICE_RE = re.compile(r"(\d[\d\s\.,]{2,})")
-LAT_RE = re.compile(r'"latitude"\s*:\s*([0-9\.\-]+)', re.IGNORECASE)
-LON_RE = re.compile(r'"longitude"\s*:\s*([0-9\.\-]+)', re.IGNORECASE)
-NEXT_DATA_RE = re.compile(r'__NEXT_DATA__', re.IGNORECASE)
+# Twardy filtr: musi wyglądać jak 350Z
+MODEL_350Z_RE = re.compile(r"\b350\s*z\b|\b350z\b", re.IGNORECASE)
 
 BLACKLIST_RE = re.compile(
     r"uszkodz|rozbit|wypadk|kolizj|po\s*wypadku|po\s*kolizji|"
@@ -61,15 +60,13 @@ class OfferStub:
 class Offer:
     title: str
     price_pln: Optional[float]
-    location: str
-    latitude: Optional[float]
-    longitude: Optional[float]
+    location: str  # "Miasto, Województwo" lub "Miasto" lub "—"
     canonical_url: str
     signature: str
 
 
 # ======================================================
-# URL / SIGNATURE / STORE
+# UTIL
 # ======================================================
 def canonicalize_url(url: str) -> str:
     return url.split("#")[0].split("?")[0].rstrip("/")
@@ -84,6 +81,21 @@ def make_signature(o: Offer) -> str:
     return sha_sig(base.lower())
 
 
+def to_number_pl(s: str) -> Optional[float]:
+    if not s:
+        return None
+    t = s.replace(" ", "").replace("\u00A0", "")
+    t = t.replace(".", "").replace(",", ".")
+    t = re.sub(r"[^0-9.]", "", t)
+    try:
+        return float(t)
+    except Exception:
+        return None
+
+
+# ======================================================
+# STORE (wysłane)
+# ======================================================
 def load_sent() -> Set[str]:
     if not os.path.exists(SENT_STORE_FILE):
         return set()
@@ -101,7 +113,7 @@ def save_sent(sent: Set[str]) -> None:
 
 
 # ======================================================
-# TELEGRAM
+# TELEGRAM (bez mapy)
 # ======================================================
 def telegram_send_message(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -116,19 +128,8 @@ def telegram_send_message(text: str) -> None:
     r.raise_for_status()
 
 
-def telegram_send_location(lat: float, lon: float) -> None:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendLocation"
-    r = requests.post(url, json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "latitude": lat,
-        "longitude": lon,
-    }, timeout=20)
-    r.raise_for_status()
-
-
 def format_msg(o: Offer) -> str:
     price = "—" if o.price_pln is None else f"{o.price_pln:,.0f} PLN".replace(",", " ")
-    # Link “mobilny”: zwykły canonical – Telegram na telefonie zwykle otwiera w aplikacji (jeśli jest).
     return (
         f"🚗 {o.title}\n"
         f"💰 Cena: {price}\n"
@@ -138,34 +139,10 @@ def format_msg(o: Offer) -> str:
 
 
 # ======================================================
-# PARSOWANIE
+# JSON helpers (Next.js)
 # ======================================================
-def to_number_pl(s: str) -> Optional[float]:
-    if not s:
-        return None
-    t = s.replace(" ", "").replace("\u00A0", "")
-    t = t.replace(".", "").replace(",", ".")
-    t = re.sub(r"[^0-9.]", "", t)
-    try:
-        return float(t)
-    except Exception:
-        return None
-
-
-def extract_coords_from_html(html: str) -> Tuple[Optional[float], Optional[float]]:
-    m1 = LAT_RE.search(html)
-    m2 = LON_RE.search(html)
-    if m1 and m2:
-        try:
-            return float(m1.group(1)), float(m2.group(1))
-        except Exception:
-            return None, None
-    return None, None
-
-
 def find_in_obj(obj: Any, keys: List[str]) -> List[Any]:
-    """Zwraca listę wartości znalezionych pod podanymi kluczami (rekurencyjnie)."""
-    found = []
+    found: List[Any] = []
     if isinstance(obj, dict):
         for k, v in obj.items():
             if k in keys:
@@ -177,19 +154,22 @@ def find_in_obj(obj: Any, keys: List[str]) -> List[Any]:
     return found
 
 
-def extract_stubs_from_next_data(html: str) -> List[OfferStub]:
+def try_get_next_data(html: str) -> Optional[dict]:
     soup = BeautifulSoup(html, "lxml")
     s = soup.find("script", id="__NEXT_DATA__")
     if not s or not s.string:
-        return []
-
+        return None
     try:
-        data = json.loads(s.string)
+        return json.loads(s.string)
     except Exception:
-        return []
+        return None
 
-    # Szukamy URL-i do ofert w różnych możliwych polach (zmienia się między wersjami)
-    candidates = find_in_obj(data, keys=["url", "href", "canonicalUrl", "link"])
+
+# ======================================================
+# LISTING -> STUBY
+# ======================================================
+def extract_stubs_from_next_data(next_data: dict) -> List[OfferStub]:
+    candidates = find_in_obj(next_data, keys=["url", "href", "canonicalUrl", "link"])
     stubs: List[OfferStub] = []
     seen = set()
 
@@ -234,35 +214,26 @@ def extract_stubs_from_html(html: str) -> List[OfferStub]:
 def fetch_list_stubs() -> List[OfferStub]:
     r = requests.get(SEARCH_URL, headers=HEADERS, timeout=25)
     r.raise_for_status()
-    html = r.text
 
-    # 1) JSON (bardziej stabilne)
-    stubs = extract_stubs_from_next_data(html)
-    if stubs:
-        return stubs
+    next_data = try_get_next_data(r.text)
+    if next_data:
+        stubs = extract_stubs_from_next_data(next_data)
+        if stubs:
+            return stubs
 
-    # 2) fallback HTML
-    return extract_stubs_from_html(html)
+    return extract_stubs_from_html(r.text)
 
 
-def extract_details_from_next_data(html: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
-    """Próbuje wyciągnąć title/price/location z __NEXT_DATA__ (jeśli jest)."""
-    soup = BeautifulSoup(html, "lxml")
-    s = soup.find("script", id="__NEXT_DATA__")
-    if not s or not s.string:
-        return None, None, None
-
-    try:
-        data = json.loads(s.string)
-    except Exception:
-        return None, None, None
-
+# ======================================================
+# DETAILS -> title / price / location (miasto + województwo)
+# ======================================================
+def extract_details_from_next_data(next_data: dict) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[str]]:
     # title
-    titles = find_in_obj(data, keys=["title", "name"])
+    titles = find_in_obj(next_data, keys=["title", "name"])
     title = next((t for t in titles if isinstance(t, str) and len(t) > 3), None)
 
     # price
-    prices = find_in_obj(data, keys=["price", "amount", "value"])
+    prices = find_in_obj(next_data, keys=["price", "amount", "value"])
     price_pln = None
     for p in prices:
         if isinstance(p, (int, float)) and p > 1000:
@@ -274,13 +245,61 @@ def extract_details_from_next_data(html: str) -> Tuple[Optional[str], Optional[f
                 price_pln = n
                 break
 
-    # location
-    locs = find_in_obj(data, keys=["location", "city", "region", "voivodeship"])
-    # zlep pierwsze sensowne stringi
-    parts = [x for x in locs if isinstance(x, str) and 2 < len(x) < 60]
-    location = ", ".join(dict.fromkeys(parts[:2])) if parts else None
+    # city / voivodeship (województwo)
+    city = None
+    voiv = None
 
-    return title, price_pln, location
+    # częste klucze
+    city_candidates = find_in_obj(next_data, keys=["city", "town"])
+    voiv_candidates = find_in_obj(next_data, keys=["region", "voivodeship", "province", "state"])
+
+    city = next((c for c in city_candidates if isinstance(c, str) and 2 < len(c) < 60), None)
+    voiv = next((v for v in voiv_candidates if isinstance(v, str) and 2 < len(v) < 60), None)
+
+    return title, price_pln, city, voiv
+
+
+def fallback_extract_price_from_text(text: str) -> Optional[float]:
+    # znajdź linie z walutą i wyciągnij liczbę
+    for line in text.split("\n"):
+        low = line.lower()
+        if "pln" in low or "zł" in low:
+            m = PRICE_RE.search(line)
+            if m:
+                n = to_number_pl(m.group(1))
+                if n is not None and n > 1000:
+                    return n
+    return None
+
+
+def fallback_extract_location_from_text(text: str) -> str:
+    """
+    Prostą heurystyką łapiemy linię wyglądającą jak "Miasto, Województwo"
+    """
+    for line in text.split("\n"):
+        l = line.strip()
+        if not (3 <= len(l) <= 60):
+            continue
+        low = l.lower()
+        if any(x in low for x in ["pln", "zł", "km", "rok", "vin", "zarejestrowan"]):
+            continue
+        # jeśli wygląda jak "X, Y" - bierz
+        if "," in l and any(ch.isalpha() for ch in l):
+            return l
+    return "—"
+
+
+def build_location(city: Optional[str], voiv: Optional[str]) -> str:
+    if city and voiv:
+        # unikaj "Warszawa, Warszawa" itp.
+        if city.strip().lower() == voiv.strip().lower():
+            return city.strip()
+        return f"{city.strip()}, {voiv.strip()}"
+    if city:
+        return city.strip()
+    if voiv:
+        return voiv.strip()
+    return "—"
 
 
 def fetch_offer_details(stub: OfferStub) -> Optional[Offer]:
@@ -289,39 +308,34 @@ def fetch_offer_details(stub: OfferStub) -> Optional[Offer]:
     r = requests.get(stub.url, headers=HEADERS, timeout=25)
     if r.status_code >= 400:
         return None
+
     html = r.text
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text("\n", strip=True)
 
-    # 1) Spróbuj z JSON
-    title, price_pln, location = extract_details_from_next_data(html)
+    next_data = try_get_next_data(html)
 
-    # 2) Fallback z HTML
+    title = None
+    price_pln = None
+    city = None
+    voiv = None
+
+    if next_data:
+        title, price_pln, city, voiv = extract_details_from_next_data(next_data)
+
+    # fallback title
     if not title:
         h1 = soup.find("h1")
         title = h1.get_text(" ", strip=True) if h1 else None
 
+    # fallback price
     if price_pln is None:
-        # spróbuj znaleźć pierwszą sensowną liczbę w pobliżu waluty
-        for line in text.split("\n"):
-            if any(x in line.lower() for x in ["pln", "zł"]):
-                m = PRICE_RE.search(line)
-                if m:
-                    price_pln = to_number_pl(m.group(1))
-                    if price_pln:
-                        break
+        price_pln = fallback_extract_price_from_text(text)
 
-    if not location:
-        # często location jest w nagłówku/sekcji szczegółów – fallback: szukamy krótkich linii z miastem/regionem
-        for line in text.split("\n"):
-            if 3 <= len(line) <= 50 and any(ch.isalpha() for ch in line):
-                # heurystyka: sporo ofert ma lokalizację jako osobną linię bez waluty/liczb
-                if not any(x in line.lower() for x in ["pln", "zł", "km", "rok", "vin"]):
-                    location = line
-                    break
-
-    # GPS (jeśli dostępny)
-    lat, lon = extract_coords_from_html(html)
+    # location
+    location = build_location(city, voiv)
+    if location == "—":
+        location = fallback_extract_location_from_text(text)
 
     canonical = canonicalize_url(stub.url)
 
@@ -329,15 +343,23 @@ def fetch_offer_details(stub: OfferStub) -> Optional[Offer]:
         title=title or "—",
         price_pln=price_pln,
         location=location or "—",
-        latitude=lat,
-        longitude=lon,
         canonical_url=canonical,
-        signature="",  # uzupełnimy po filtrach
+        signature="",
     )
 
-    # Filtry (blacklista + limit)
+    # --------------------------------------------------
+    # TWARDY FILTR: tylko 350Z
+    # (Nissan Note / inne modele odpadają tutaj)
+    # --------------------------------------------------
+    hay = (offer.title or "") + "\n" + text
+    if not MODEL_350Z_RE.search(hay):
+        return None
+
+    # Filtry jakości
     if BLACKLIST_RE.search(text):
         return None
+
+    # Filtr ceny
     if offer.price_pln is None or offer.price_pln > MAX_PLN:
         return None
 
@@ -352,10 +374,17 @@ def main():
     sent = load_sent()
     stubs = fetch_list_stubs()
 
-    stats = {"stubs": len(stubs), "checked": 0, "sent": 0, "already_sent": 0, "filtered": 0}
+    stats = {
+        "stubs": len(stubs),
+        "checked": 0,
+        "sent": 0,
+        "already_sent": 0,
+        "filtered": 0,
+    }
 
     for stub in stubs[:MAX_DETAIL_PAGES_PER_RUN]:
         stats["checked"] += 1
+
         offer = fetch_offer_details(stub)
         if not offer:
             stats["filtered"] += 1
@@ -364,11 +393,6 @@ def main():
         if offer.signature in sent:
             stats["already_sent"] += 1
             continue
-
-        # najpierw pinezka (jeśli mamy), potem wiadomość
-        if offer.latitude is not None and offer.longitude is not None:
-            telegram_send_location(offer.latitude, offer.longitude)
-            time.sleep(1.0)
 
         telegram_send_message(format_msg(offer))
         sent.add(offer.signature)
